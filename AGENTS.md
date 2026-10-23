@@ -1,42 +1,13 @@
 # AGENTS.md — clamav-api
 
-HTTP wrapper around ClamAV used by pdfcompressor. Infra notes:
-`~/Projects/infra/docs/applications.md`.
+Small HTTP wrapper around ClamAV used by the PDF compressor
+(`POST /scan` with a multipart `file`, `GET /health`).
 
-## Deploy
+Deployment hosts, IPs, paths and the private registry are not kept in this
+public repository; they live in the private infra docs and the local-only
+`AGENTS.local.md` (gitignored).
 
-| | |
-|---|---|
-| Host | `compressor` = **x.x.x.x**, `/home/user/clamav-api` |
-| Compose project | default (`clamav-api`): `clamav_engine` + `clamav_api` |
-| Engine | `clamav/clamav:1.5` (`platform: linux/amd64`), named volume `clamav_data` |
-| API | local build `clamav-api-api`, port **5001 → 5000** |
-| Endpoints | `POST /scan` (multipart field `file`), `GET /health` |
-
-```bash
-cd /home/user/clamav-api
-docker compose up -d --build
-curl -s http://127.0.0.1:5001/health
-```
-
-Remote: GitHub `git@github.com:tudorr89/clamav-api.git`.
-First engine start downloads the signature DB (minutes) into `clamav_data`.
-
-## Why the config looks like this
-
-- **clamd defaults reject big PDFs**: `StreamMaxLength`/`MaxFileSize` default to
-  100MB (INSTREAM), so a 150MB upload failed even though the app advertises
-  500MB. The compose file sets via `CLAMD_CONF_*`:
-  `StreamMaxLength=550M`, `MaxFileSize=550M`, `MaxScanSize=1G`,
-  `MaxScanTime=300000`. Keep these >= the client upload limit.
-- API runs behind **waitress** (not the Flask dev server), as a non-root user,
-  with `MAX_CONTENT_LENGTH=MAX_UPLOAD_MB` (413) and `CLAMAV_TIMEOUT=300`.
-- `scan_stream()` streams to clamd via INSTREAM; nothing is written to disk.
-- Scanner problems (clamd down, INSTREAM limit, scan error) return **503**;
-  clean/infected stay **200** so clients can distinguish "virus" from
-  "scanner unavailable".
-
-## Response contract
+## Contract
 
 | Response | Meaning |
 |---|---|
@@ -46,11 +17,37 @@ First engine start downloads the signature DB (minutes) into `clamav_data`.
 | `413` | larger than `MAX_UPLOAD_MB` |
 | `503` | clamd unreachable / scan failed |
 
-No authentication: keep it on the LAN/tailnet only.
+Scanner problems return **503** so clients can tell "virus" apart from
+"scanner unavailable". There is no authentication — bind it to a private
+network only.
+
+## Runtime
+
+- Runs behind **waitress** (not the Flask dev server) as a non-root user.
+- `MAX_CONTENT_LENGTH = MAX_UPLOAD_MB` (413 instead of buffering unbounded
+  uploads) and `CLAMAV_TIMEOUT` on the clamd socket.
+- `scan_stream()` sends the upload to clamd via INSTREAM, nothing is written to
+  disk by the API.
+
+## clamd limits (important)
+
+`clamav/clamav` defaults to `StreamMaxLength`/`MaxFileSize` of **100MB**, so
+larger PDFs are rejected by INSTREAM even when the client advertises 500MB.
+The compose file raises them via `CLAMD_CONF_*`:
+
+```yaml
+CLAMD_CONF_StreamMaxLength: "550M"
+CLAMD_CONF_MaxFileSize: "550M"
+CLAMD_CONF_MaxScanSize: "1G"
+CLAMD_CONF_MaxScanTime: "300000"
+```
+
+Keep these >= the largest file the clients accept. The engine keeps its
+signature database in the `clamav_data` volume (first start downloads it).
 
 ## Local testing
 
 ```bash
-docker compose up -d --build      # in a copy of this repo
+docker compose up -d --build
 curl -s -F "file=@some.pdf" http://127.0.0.1:5001/scan
 ```
