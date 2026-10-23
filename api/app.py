@@ -1,118 +1,104 @@
-import os
+"""Thin HTTP wrapper around the ClamAV daemon (clamd).
+
+The scanner runs out-of-process: this service only streams the upload to clamd
+and maps the result to a small JSON contract:
+
+    {"status": "clean"}                      -> 200
+    {"status": "infected", "virus": "..."}   -> 200
+    {"status": "error", "message": "..."}    -> 4xx/5xx (client errors / scanner down)
+"""
+
 import logging
-from flask import Flask, request, jsonify
+import os
+
 import pyclamd
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import RequestEntityTooLarge
+from waitress import serve
 
-# --- Configuration & Initialization ---
-
-# Configure basic logging to see detailed output in the container logs
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+logger = logging.getLogger(__name__)
 
-# Initialize the Flask application
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "550"))
+CLAMAV_HOST = os.getenv("CLAMAV_HOST", "clamav")
+CLAMAV_PORT = int(os.getenv("CLAMAV_PORT", "3310"))
+CLAMAV_TIMEOUT = int(os.getenv("CLAMAV_TIMEOUT", "300"))
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
-# --- ClamAV Connection ---
 
-# The ClamAV daemon (clamd) service name as defined in docker-compose.yml
-CLAMAV_HOST = 'clamav'
-CLAMAV_PORT = 3310
+class ScannerUnavailable(RuntimeError):
+    """clamd is not reachable or rejected the scan."""
 
-def get_clamd_socket():
-    """
-    Initializes and returns a connection to the ClamAV daemon.
-    This function specifically uses a NETWORK socket.
-    """
+
+def clamd_client() -> pyclamd.ClamdNetworkSocket:
     try:
-        # Explicitly log the connection attempt details. This is key for debugging.
-        logging.info(f"Attempting to connect to ClamAV via NETWORK socket at {CLAMAV_HOST}:{CLAMAV_PORT}")
+        client = pyclamd.ClamdNetworkSocket(
+            host=CLAMAV_HOST, port=CLAMAV_PORT, timeout=CLAMAV_TIMEOUT
+        )
+        if not client.ping():
+            raise ScannerUnavailable("clamd did not answer PING")
+        return client
+    except Exception as exc:  # noqa: BLE001 - surfaced as 503
+        raise ScannerUnavailable(str(exc)) from exc
 
-        # Create a network socket connection to the clamd daemon.
-        # This is the correct method for a multi-container Docker setup.
-        cd = pyclamd.ClamdNetworkSocket(host=CLAMAV_HOST, port=CLAMAV_PORT)
 
-        # Ping the server to ensure the connection is alive.
-        # This will raise a ConnectionError if it fails, which will be caught.
-        cd.ping()
+@app.errorhandler(RequestEntityTooLarge)
+def handle_too_large(_):
+    return jsonify(
+        {"status": "error", "message": f"File exceeds {MAX_UPLOAD_MB} MiB"}
+    ), 413
 
-        logging.info("Successfully connected and pinged the ClamAV daemon.")
-        return cd
 
-    except Exception as e:
-        # Log the specific error, which is crucial for troubleshooting.
-        logging.error(f"Failed to connect to ClamAV daemon at {CLAMAV_HOST}:{CLAMAV_PORT}. Error: {e}")
-        logging.error("This usually means the 'clamav' container is not running, not healthy, or not reachable on the Docker network.")
-        logging.error("Please check the clamav container's status and logs with: docker-compose logs -f clamav")
-        return None
-
-# --- API Endpoints ---
-
-@app.route('/scan', methods=['POST'])
+@app.route("/scan", methods=["POST"])
 def scan_file():
-    """
-    Handles file uploads and scans them for viruses.
-    """
-    # 1. Validate the incoming request
-    if 'file' not in request.files:
-        logging.warning("Scan request received with no file part.")
+    upload = request.files.get("file")
+
+    if upload is None or upload.filename == "":
+        logger.warning("Scan request received without a file part")
         return jsonify({"status": "error", "message": "No file part in the request."}), 400
 
-    file = request.files['file']
-
-    if file.filename == '':
-        logging.warning("Scan request received with an empty filename.")
-        return jsonify({"status": "error", "message": "No file selected for uploading."}), 400
-
-    # 2. Connect to the ClamAV daemon
-    clamd_socket = get_clamd_socket()
-    if not clamd_socket:
-        # The error is already logged in get_clamd_socket()
-        return jsonify({"status": "error", "message": "Could not connect to the scanner service. Check API logs for details."}), 503
-
-    # 3. Scan the file stream
     try:
-        logging.info(f"Scanning file: {file.filename}")
-        # The scan_stream method is efficient as it scans the file in chunks
-        # without saving it to disk on the API server.
-        scan_result = clamd_socket.scan_stream(file.stream)
+        client = clamd_client()
+    except ScannerUnavailable as exc:
+        logger.error("clamd unavailable: %s", exc)
+        return jsonify({"status": "error", "message": "Scanner unavailable"}), 503
 
-        # 4. Process the scan result
-        if scan_result is None:
-            # No virus found
-            logging.info(f"File is clean: {file.filename}")
-            return jsonify({"status": "clean", "message": "File is clean."}), 200
-        else:
-            # Virus found
-            virus_name = scan_result['stream'][1]
-            logging.warning(f"Infected file detected: {file.filename}, Virus: {virus_name}")
-            return jsonify({
-                "status": "infected",
-                "message": "File is infected!",
-                "virus": virus_name
-            }), 200
+    try:
+        # scan_stream() uses INSTREAM, so nothing is written to disk here.
+        result = client.scan_stream(upload.stream)
+    except Exception as exc:  # noqa: BLE001 - includes INSTREAM size limits
+        logger.error("Scan failed for %s: %s", upload.filename, exc)
+        return jsonify({"status": "error", "message": "Scan failed"}), 503
 
-    except Exception as e:
-        logging.error(f"An error occurred during scanning: {e}")
-        return jsonify({"status": "error", "message": "An unexpected error occurred during the scan."}), 500
+    if result is None:
+        logger.info("Clean: %s", upload.filename)
+        return jsonify({"status": "clean"}), 200
+
+    virus = result.get("stream", ("FOUND", "unknown"))[1]
+    logger.warning("Infected: %s (%s)", upload.filename, virus)
+    return jsonify({"status": "infected", "virus": virus}), 200
 
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health_check():
-    """
-    A simple health check endpoint to verify service status.
-    """
-    clamd_socket = get_clamd_socket()
-    if clamd_socket:
+    try:
+        clamd_client()
         return jsonify({"status": "ok", "clamav_connection": "successful"}), 200
-    else:
+    except ScannerUnavailable:
         return jsonify({"status": "error", "clamav_connection": "failed"}), 503
 
-# --- Main Execution ---
 
-if __name__ == '__main__':
-    # Run the Flask app
-    # host='0.0.0.0' makes the server accessible from other Docker containers
-    # and the host machine.
-    app.run(host='0.0.0.0', port=5000, debug=False)
+if __name__ == "__main__":
+    # Waitress is a production WSGI server; the Flask dev server is single
+    # threaded and explicitly not meant for this.
+    serve(
+        app,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "5000")),
+        threads=int(os.getenv("THREADS", "4")),
+    )

@@ -1,47 +1,49 @@
-# This docker-compose file sets up a two-service application:
-# 1. 'clamav': The official ClamAV container running the clamd daemon for scanning.
-# 2. 'api': Our custom Python Flask API that receives file uploads and asks the
-#    'clamav' service to scan them.
+# Two services:
+#   clamav - the official ClamAV daemon (clamd)
+#   api    - a small Flask/waitress wrapper exposing POST /scan and GET /health
 
 services:
-  # The ClamAV Antivirus Scanner Service
   clamav:
-    # Use the official ClamAV image with support for the clamd daemon
-    image: clamav/clamav:1.3
+    image: clamav/clamav:1.5
     platform: linux/amd64
     container_name: clamav_engine
-    # Restart the container automatically if it fails
     restart: unless-stopped
+    environment:
+      # clamd's defaults (100 MiB stream / 400 MiB scan) silently reject the
+      # large PDFs this API is meant to accept, so align them with the API's
+      # upload limit. INSTREAM is what scan_stream() uses.
+      CLAMD_CONF_StreamMaxLength: "550M"
+      CLAMD_CONF_MaxFileSize: "550M"
+      CLAMD_CONF_MaxScanSize: "1G"
+      CLAMD_CONF_MaxScanTime: "300000"
     volumes:
-      # Mount a named volume to persist the virus database.
-      # This prevents re-downloading the entire database every time the container starts.
       - clamav_data:/var/lib/clamav
     networks:
       - antivirus-net
 
-  # The Python Flask API Service
   api:
     container_name: clamav_api
     platform: linux/amd64
-    # Build the API image from the Dockerfile located in the './api' directory
     build: ./api
     restart: unless-stopped
-    # Expose port 5001 on the host and map it to port 5000 inside the container
+    environment:
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      # Must stay below the client timeout (pdfcompressor AV_TIMEOUT).
+      CLAMAV_TIMEOUT: "300"
+      MAX_UPLOAD_MB: "550"
     ports:
       - "5001:5000"
-    # The API service depends on the 'clamav' service.
-    # This ensures that 'clamav' is started before the 'api' service.
     depends_on:
-      - clamav
+      clamav:
+        condition: service_healthy
     networks:
       - antivirus-net
 
-# Define the network that allows the services to communicate
 networks:
   antivirus-net:
     driver: bridge
 
-# Define the named volume for persisting ClamAV data
 volumes:
   clamav_data:
     driver: local

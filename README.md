@@ -7,11 +7,42 @@ This project provides a simple, containerized RESTful API for scanning files for
 ```
 .
 ├── api/
-│   ├── app.py             # The Flask API code
-│   ├── Dockerfile         # Docker instructions for the API service
-│   └── requirements.txt   # Python dependencies
-└── docker-compose.yml     # Orchestrates the API and ClamAV services
+│   ├── app.py             # Flask/waitress API (POST /scan, GET /health)
+│   ├── Dockerfile         # Non-root runtime image
+│   ├── requirements.txt   # Pinned Python dependencies
+│   └── .dockerignore
+└── docker-compose.yaml    # Orchestrates the API and ClamAV services
 ```
+
+### API
+
+`POST /scan` with a multipart field named `file`:
+
+| Response | Meaning |
+| --- | --- |
+| `200 {"status":"clean"}` | no threat found |
+| `200 {"status":"infected","virus":"..."}` | threat found |
+| `400 {"status":"error"}` | request without a file |
+| `413 {"status":"error"}` | upload larger than `MAX_UPLOAD_MB` |
+| `503 {"status":"error"}` | clamd unreachable or the scan failed |
+
+`GET /health` returns `200` when clamd answers `PING`, otherwise `503`.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CLAMAV_HOST` | `clamav` | clamd hostname |
+| `CLAMAV_PORT` | `3310` | clamd port |
+| `CLAMAV_TIMEOUT` | `300` | socket timeout in seconds |
+| `MAX_UPLOAD_MB` | `550` | maximum accepted upload |
+| `THREADS` | `4` | waitress worker threads |
+
+clamd itself is configured through `CLAMD_CONF_*` variables in
+`docker-compose.yaml`. The defaults (100 MiB `StreamMaxLength`) are too small
+for large PDFs, so this stack raises `StreamMaxLength`/`MaxFileSize` to 550 MiB
+and `MaxScanSize` to 1 GiB. Keep `MAX_UPLOAD_MB` >= the largest file your
+clients send and `CLAMAV_TIMEOUT` below the client's own timeout.
 
 ### Prerequisites
 
@@ -20,7 +51,7 @@ This project provides a simple, containerized RESTful API for scanning files for
 
 ### Setup & Installation
 
-1.  **Save the Files:** Create the directory structure and files as provided. Place `docker-compose.yml` in the root directory, and the other three files inside the `api/` subdirectory.
+1.  **Save the Files:** Create the directory structure and files as provided. Place `docker-compose.yaml` in the root directory, and the other three files inside the `api/` subdirectory.
 
 2.  **Build and Run the Services:** Open a terminal in the root directory of the project and run the following command:
 
